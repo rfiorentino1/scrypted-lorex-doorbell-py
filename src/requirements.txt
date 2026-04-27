@@ -1,0 +1,14 @@
+# pwntools and pyOpenSSL deliberately omitted — both pull `cffi`, which
+# pip resolves to 2.0 and then conflicts with the host's bundled
+# `_cffi_backend` 1.16 inside Scrypted's plugin worker.
+#
+#   pwntools  → DahuaConsole used p8/p16/p32/p64/u8/u16/u32/u64 byte
+#               pack/unpack helpers, now provided by a stdlib-backed
+#               `pwn.py` shim in src/lorex/DahuaConsole/
+#   pyOpenSSL → DahuaConsole used crypto.load_certificate only in an
+#               unused CertManager debug path; replaced with an
+#               `OpenSSL.py` stub in src/lorex/DahuaConsole/
+pycryptodome>=3.9.7
+ndjson>=0.3.1
+requests>=2.20.0
+tzlocal>=2.1

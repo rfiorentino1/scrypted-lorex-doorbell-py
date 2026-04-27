@@ -1,0 +1,48 @@
+{
+    "name": "scrypted-lorex-doorbell-py",
+    "version": "0.2.0-dev",
+    "description": "Scrypted plugin for Lorex B451AJ and compatible Dahua/Skywatch doorbells. Connects directly via DVRIP, exposes RTSP video, button-press, motion, snapshot, and two-way intercom audio in HomeKit.",
+    "author": "Rocco Fiorentino",
+    "license": "MIT",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/rfiorentino1/scrypted-lorex-doorbell.git"
+    },
+    "scripts": {
+        "scrypted-setup-project": "scrypted-setup-project",
+        "prescrypted-setup-project": "scrypted-package-json",
+        "build": "scrypted-webpack",
+        "prepublishOnly": "NODE_ENV=production scrypted-webpack",
+        "scrypted-deploy": "scrypted-deploy",
+        "scrypted-deploy-debug": "scrypted-deploy-debug",
+        "scrypted-debug": "scrypted-debug",
+        "scrypted-readme": "scrypted-readme",
+        "scrypted-package-json": "scrypted-package-json"
+    },
+    "keywords": [
+        "scrypted",
+        "scrypted-plugin",
+        "homekit",
+        "doorbell",
+        "lorex",
+        "dahua",
+        "skywatch",
+        "dvrip"
+    ],
+    "scrypted": {
+        "name": "Lorex Doorbell",
+        "runtime": "python",
+        "type": "DeviceProvider",
+        "interfaces": [
+            "DeviceProvider",
+            "DeviceCreator",
+            "Settings"
+        ],
+        "pluginDependencies": [
+            "@scrypted/snapshot"
+        ]
+    },
+    "devDependencies": {
+        "@scrypted/sdk": "^0.5.59"
+    }
+}
