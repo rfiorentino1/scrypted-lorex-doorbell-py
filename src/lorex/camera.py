@@ -355,28 +355,31 @@ class LorexDoorbellCamera(ScryptedDeviceBase):
                      self.nativeId, self._talk.sid, self._talk.conn_id)
 
             # Spawn ffmpeg to transcode whatever HomeKit gives us into
-            # PCMA-8k mono, writing 320-byte (40ms) frames to fd 3 which
-            # we then push into the DVRIP talk channel.
+            # PCMA at 22.05 kHz mono — the rate Lorex/Skywatch expects on
+            # its DVRIP talk channel (882 bytes per 40ms frame). The
+            # talk.py docstring labels it "PCMA-8k" but the wire format
+            # is actually 22.05k; sending true 8 kHz produces silence
+            # because each 320-byte 40ms frame gets padded to 882 with
+            # a-law silence inside push_frame.
             args = list(ffmpeg_input.get('inputArguments') or [])
             args.extend([
-                '-vn', '-acodec', 'pcm_alaw', '-ar', '8000', '-ac', '1',
-                '-f', 'alaw', 'pipe:3',
+                '-vn', '-acodec', 'pcm_alaw', '-ar', '22050', '-ac', '1',
+                '-f', 'alaw', 'pipe:1',
             ])
-            read_fd, write_fd = os.pipe()
+            log.info('[%s] intercom: ffmpeg args: %s', self.nativeId, ' '.join(args))
             self._intercom_proc = await asyncio.create_subprocess_exec(
                 ffmpeg_path, *args,
                 stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                pass_fds=(write_fd,),
-                preexec_fn=lambda: os.dup2(write_fd, 3),
             )
-            os.close(write_fd)
-            self._intercom_task = asyncio.create_task(
-                self._intercom_pump(read_fd))
-        except Exception:
+            log.info('[%s] intercom: ffmpeg spawned pid=%s, starting pump',
+                     self.nativeId, self._intercom_proc.pid)
+            self._intercom_task = asyncio.create_task(self._intercom_pump())
+        except Exception as e:
             # Failure path: clean up partially-initialized talk session
             # so the next attempt isn't blocked by stale state.
+            log.error('[%s] intercom: startIntercom failed: %r', self.nativeId, e)
             try:
                 await asyncio.to_thread(self._talk.close)
             except Exception:
@@ -384,25 +387,48 @@ class LorexDoorbellCamera(ScryptedDeviceBase):
             self._talk = None
             raise
 
-    async def _intercom_pump(self, read_fd: int) -> None:
-        FRAME = 320  # PCMA-8k mono, 40ms
+    async def _intercom_pump(self) -> None:
+        FRAME = 882  # PCMA @ 22.05 kHz mono, 40ms — matches talk.PCMA_FRAME_BYTES
+        proc = self._intercom_proc
+        if proc is None or proc.stdout is None:
+            log.error('[%s] intercom pump: no proc/stdout', self.nativeId)
+            return
+        frames_sent = 0
         try:
-            loop = asyncio.get_event_loop()
             buf = b''
-            reader = os.fdopen(read_fd, 'rb', buffering=0)
             while True:
-                chunk = await loop.run_in_executor(None, reader.read, 8192)
+                chunk = await proc.stdout.read(8192)
                 if not chunk:
+                    log.info('[%s] intercom pump: ffmpeg stdout EOF after %d frames',
+                             self.nativeId, frames_sent)
                     break
                 buf += chunk
                 while len(buf) >= FRAME:
                     frame, buf = buf[:FRAME], buf[FRAME:]
                     if self._talk is not None:
                         await asyncio.to_thread(self._talk.push_frame, frame)
+                        frames_sent += 1
+                        if frames_sent in (1, 25, 250):
+                            log.info('[%s] intercom pump: pushed %d frames',
+                                     self.nativeId, frames_sent)
             if buf and self._talk is not None:
                 await asyncio.to_thread(self._talk.push_frame, buf)
+        except asyncio.CancelledError:
+            log.info('[%s] intercom pump: cancelled (%d frames pushed)',
+                     self.nativeId, frames_sent)
+            raise
         except Exception as e:
-            log.error('[%s] intercom pump error: %r', self.nativeId, e)
+            log.error('[%s] intercom pump error after %d frames: %r',
+                      self.nativeId, frames_sent, e)
+            # Surface ffmpeg stderr for diagnosis
+            if proc is not None and proc.stderr is not None:
+                try:
+                    err = await proc.stderr.read(2000)
+                    if err:
+                        log.error('[%s] intercom ffmpeg stderr: %s',
+                                  self.nativeId, err.decode('utf-8', 'replace')[:1000])
+                except Exception:
+                    pass
 
     async def stopIntercom(self) -> None:
         if self._intercom_task is not None:
