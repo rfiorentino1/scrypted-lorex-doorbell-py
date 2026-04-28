@@ -99,6 +99,28 @@ There's a **Test Press** / **Test Motion** button under the device's
 Settings → Debug subgroup for end-to-end verification without anyone
 needing to physically press the doorbell.
 
+## Press webhook (optional)
+
+For external integrations — e.g. an NAS-side process that builds an
+event clip from continuous recordings whenever the doorbell rings —
+fill in **Press Webhook URL** under the device's Advanced settings.
+On the *first* event in each press chain (mirroring the HomeKit
+notification semantics), the plugin POSTs:
+
+```json
+{
+  "timestamp": "2026-04-28T15:29:04",
+  "deviceId": "<scrypted nativeId>",
+  "deviceName": "Front Door",
+  "event": "press"
+}
+```
+
+…to the configured URL with `Content-Type: application/json` and a
+3-second timeout. Failures are logged at WARNING and otherwise
+ignored — the webhook never affects HomeKit notifications or the
+press handler.
+
 ## License
 
 [MIT](LICENSE). Includes a vendored copy of [mcw0/DahuaConsole](https://github.com/mcw0/DahuaConsole)

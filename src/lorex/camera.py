@@ -8,10 +8,13 @@ press chain (BackKeyLight + VideoTalk + CallNoAnswered + PhoneCallDetect
 all firing within ~20ms) only produces ONE HomeKit notification.
 """
 import asyncio
+import datetime
+import json
 import logging
 import os
 import threading
 import time
+import urllib.request
 from typing import Any, Dict, List, Optional, Set
 
 import scrypted_sdk
@@ -172,12 +175,49 @@ class LorexDoorbellCamera(ScryptedDeviceBase):
         # Idempotent within hold window: only flip false→true on the
         # FIRST event in a press chain. Subsequent events refresh the
         # auto-reset timer but don't re-emit binaryState.
-        if not self.binaryState:
+        first_press_in_chain = not self.binaryState
+        if first_press_in_chain:
             self.binaryState = True
         if self._press_reset is not None:
             self._press_reset.cancel()
         self._press_reset = self._loop.call_later(
             PRESS_HOLD_SEC, self._reset_press)
+
+        # Optional webhook for external integrations (e.g. NAS-side event
+        # extractor that builds pre-roll+post-roll clips from continuous
+        # recordings). Fire only on the first press in a chain so the
+        # external system gets one notification per real press, mirroring
+        # HomeKit's binaryState semantics.
+        if first_press_in_chain:
+            webhook_url = (self.storage.getItem('pressWebhookUrl') or '').strip()
+            if webhook_url:
+                press_ts = datetime.datetime.now().isoformat(timespec='seconds')
+                threading.Thread(
+                    target=self._fire_press_webhook,
+                    args=(webhook_url, press_ts),
+                    daemon=True,
+                ).start()
+
+    def _fire_press_webhook(self, url: str, timestamp: str) -> None:
+        """Best-effort POST. Never raises — webhook failures must not
+        affect the press handler or HomeKit notification path."""
+        try:
+            payload = json.dumps({
+                'timestamp': timestamp,
+                'deviceId': self.nativeId,
+                'deviceName': self.providedName or self.nativeId,
+                'event': 'press',
+            }).encode('utf-8')
+            req = urllib.request.Request(
+                url,
+                data=payload,
+                headers={'Content-Type': 'application/json'},
+                method='POST',
+            )
+            urllib.request.urlopen(req, timeout=3).read()
+        except Exception as e:  # noqa: BLE001 - intentionally swallowed
+            log.warning('[%s] press webhook to %s failed: %s',
+                        self.nativeId, url, e)
 
     def _reset_press(self) -> None:
         self.binaryState = False
@@ -236,6 +276,17 @@ class LorexDoorbellCamera(ScryptedDeviceBase):
                 'title': 'Snapshot URL Override',
                 'value': self.storage.getItem('snapshotUrl') or '',
                 'description': 'Optional direct JPEG snapshot URL (most Skywatch firmware blocks port 80, leave blank to use ffmpeg from RTSP).',
+                'subgroup': 'Advanced',
+            },
+            {
+                'key': 'pressWebhookUrl',
+                'title': 'Press Webhook URL',
+                'value': self.storage.getItem('pressWebhookUrl') or '',
+                'description': 'Optional. POSTs JSON {timestamp, deviceId, deviceName, event:"press"} '
+                               'to this URL on each press (first event in a chain only — mirrors '
+                               'HomeKit notification semantics). Useful for external recording / '
+                               'event-clip pipelines. Failures are logged and ignored; HomeKit '
+                               'notifications are unaffected.',
                 'subgroup': 'Advanced',
             },
             # Debug actions (replace the old /inject HTTP endpoint).
