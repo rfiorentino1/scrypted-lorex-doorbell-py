@@ -33,12 +33,21 @@ log = logging.getLogger('lorex.camera')
 # Press semantics: any of these codes (Start or Pulse) means the button
 # was pressed. We OR-trigger because Lorex Skywatch firmware emits a
 # different subset on each press; relying on any single code misses
-# presses. None of these codes appear during motion-only events in the
-# bridge logs we have, so OR-ing is safe.
+# presses. Each code below has been verified against the bridge log to
+# fire ONLY in press chains, never during motion-only events.
+#
+# DO NOT add `BackKeyLight` here. It was previously included on the
+# (mistaken) assumption that the button-LED pulse was press-only, but
+# the bridge log shows BackKeyLight Pulse firing during motion-only
+# sequences (e.g. 2026-04-24 19:06:21 and 21:59:03/30 — VideoMotion +
+# CrossRegionDetection chains with no VideoTalk/CallNoAnswered/
+# PhoneCallDetect). The doorbell pulses the button LED for visibility
+# during motion at night, so it's NOT a reliable press signal. Real
+# presses still fire VideoTalk + CallNoAnswered + PhoneCallDetect
+# within ~20ms of each other, which is enough to catch every press.
 PRESS_CODES: Set[str] = {
     'VideoTalk',
     'PhoneCallDetect',
-    'BackKeyLight',
     'CallNoAnswered',
     'VideoTalkInvite',
 }
