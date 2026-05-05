@@ -43,15 +43,22 @@ log = logging.getLogger('lorex.camera')
 # (mistaken) assumption that the button-LED pulse was press-only, but
 # the bridge log shows BackKeyLight Pulse firing during motion-only
 # sequences (e.g. 2026-04-24 19:06:21 and 21:59:03/30 — VideoMotion +
-# CrossRegionDetection chains with no VideoTalk/CallNoAnswered/
-# PhoneCallDetect). The doorbell pulses the button LED for visibility
-# during motion at night, so it's NOT a reliable press signal. Real
-# presses still fire VideoTalk + CallNoAnswered + PhoneCallDetect
-# within ~20ms of each other, which is enough to catch every press.
+# CrossRegionDetection chains with no VideoTalk/PhoneCallDetect). The
+# doorbell pulses the button LED for visibility during motion at night,
+# so it's NOT a reliable press signal.
+#
+# DO NOT add `CallNoAnswered` here. Per the Dahua VTO event vocabulary
+# (riogrande75/Dahua DahuaEventHandler.php), CallNoAnswered fires at
+# the SIP no-answer timeout — roughly 10 seconds AFTER the press, when
+# the doorbell gives up trying to ring its paired VTH. Including it
+# caused a duplicate press chain ~10s after the real press, since
+# PRESS_HOLD_SEC (3s) had already elapsed by then. Verified 2026-04-29
+# from clip-offset analysis: real press at T, wave-1 codes (VideoTalk
+# + PhoneCallDetect + VideoTalkInvite) fire at T+4s, CallNoAnswered
+# fires at T+14s.
 PRESS_CODES: Set[str] = {
     'VideoTalk',
     'PhoneCallDetect',
-    'CallNoAnswered',
     'VideoTalkInvite',
 }
 
@@ -191,7 +198,7 @@ class LorexDoorbellCamera(ScryptedDeviceBase):
         if first_press_in_chain:
             webhook_url = (self.storage.getItem('pressWebhookUrl') or '').strip()
             if webhook_url:
-                press_ts = datetime.datetime.now().isoformat(timespec='seconds')
+                press_ts = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
                 threading.Thread(
                     target=self._fire_press_webhook,
                     args=(webhook_url, press_ts),

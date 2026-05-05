@@ -49,13 +49,35 @@ def _make_dargs(host: str, port: int, user: str, password: str,
 
 class _LorexBridge(DahuaFunctions):
     """Thin DahuaFunctions subclass that re-routes event notifications
-    into our callback instead of DahuaConsole's internal logging."""
+    into our callback instead of DahuaConsole's internal logging.
+
+    Also tracks `last_inbound_ts` — the monotonic time of the most recent
+    packet received from the doorbell. DvripClient's stall watchdog reads
+    this to decide whether the connection has silently died.
+    """
 
     def __init__(self, on_event: Callable[[Dict[str, Any]], None], **kwargs):
         self._on_event = on_event
+        # Set BEFORE super().__init__ so any inbound traffic during the
+        # base class's connect path can update it without AttributeError.
+        self.last_inbound_ts: float = time.monotonic()
         super().__init__(**kwargs)
 
+    def _check_for_keepalive(self, dh_data):
+        # Every inbound packet — keepalive pong, event notification, error
+        # response, anything — passes through this method. Updating
+        # `last_inbound_ts` here gives us a single source of truth for
+        # connection liveness that doesn't depend on which event types
+        # the doorbell happens to be emitting.
+        self.last_inbound_ts = time.monotonic()
+        return super()._check_for_keepalive(dh_data)
+
     def client_notify(self, dh_data):
+        # Defensive double-tap: if super()._check_for_keepalive's
+        # AttributeError fallback path routes data here without going
+        # through our override above, still update the timestamp.
+        self.last_inbound_ts = time.monotonic()
+
         try:
             payload = json.loads(dh_data) if isinstance(dh_data, str) else dh_data
         except Exception:
@@ -134,11 +156,27 @@ class DvripClient:
             self._thread = None
         self._dh = None
 
+    # Force a reconnect if no inbound packet has arrived in this many
+    # seconds. The doorbell normally sends keepalive pongs every ~30-60s
+    # (whatever it advertises as `keepAliveInterval` after login), plus
+    # frequent event traffic; a 2-minute silence is decisive evidence
+    # that the connection has gone zombie.
+    #
+    # Why this exists: DahuaConsole's _p2p_keepalive thread is started via
+    # `_thread.start_new_thread()` (a low-level thread with no excepthook).
+    # Its main RPC loop only catches `requests.exceptions.RequestException`
+    # and `EOFError` — anything else (e.g. ConnectionResetError during a
+    # WiFi roam) kills the thread silently without setting `self.terminate`.
+    # The outer loop then spins forever in `time.sleep(1)` thinking the
+    # connection is alive. This watchdog is what actually unsticks us.
+    STALL_TIMEOUT_SEC = 120
+
     def _run(self) -> None:
         backoff = 5
         while not self._stop.is_set():
             dargs = _make_dargs(self.host, self.port, self.user,
                                 self.password, self.proto)
+            stall_reason: Optional[str] = None
             try:
                 self._dh = _LorexBridge(
                     on_event=self.on_event,
@@ -160,11 +198,55 @@ class DvripClient:
                     start=True)
                 self.on_state(True)
                 backoff = 5
-                while not self._stop.is_set() and not self._dh.terminate:
+                # Reset liveness clock on (re)attach — we want a full grace
+                # period before the watchdog can fire on a fresh connection.
+                self._dh.last_inbound_ts = time.monotonic()
+                log.info('eventManager attached; stall watchdog armed '
+                         '(threshold=%ds)', self.STALL_TIMEOUT_SEC)
+
+                while not self._stop.is_set():
                     time.sleep(1)
+                    # 1) DahuaConsole's keepalive thread already detected
+                    #    a real disconnect and tore itself down.
+                    if self._dh.terminate:
+                        stall_reason = 'DahuaConsole signaled terminate'
+                        break
+                    # 2) Underlying TCP socket is gone. The keepalive thread
+                    #    may have died silently without setting terminate,
+                    #    but the OS still knows the socket is dead.
+                    try:
+                        if not self._dh.remote.connected():
+                            stall_reason = 'TCP socket reports not connected'
+                            break
+                    except Exception as e:
+                        stall_reason = f'remote.connected() raised: {e!r}'
+                        break
+                    # 3) Stall: keepalive thread silently died but the
+                    #    socket is still in ESTABLISHED state from the OS's
+                    #    point of view. No inbound packets for too long.
+                    silence = time.monotonic() - self._dh.last_inbound_ts
+                    if silence > self.STALL_TIMEOUT_SEC:
+                        stall_reason = (f'no inbound traffic for {silence:.0f}s '
+                                        f'(>{self.STALL_TIMEOUT_SEC}s threshold)')
+                        break
             except Exception as e:
                 log.error('connection failed: %r', e)
             finally:
+                if stall_reason is not None:
+                    log.warning('forcing reconnect: %s', stall_reason)
+                    # Best-effort hard tear-down so the cleanup path below
+                    # doesn't try to RPC over a dead/zombie socket and
+                    # block on it.
+                    try:
+                        if self._dh is not None:
+                            self._dh.terminate = True
+                    except Exception:
+                        pass
+                    try:
+                        if self._dh is not None and self._dh.remote is not None:
+                            self._dh.remote.close()
+                    except Exception:
+                        pass
                 self.on_state(False)
                 try:
                     if self._dh is not None:
