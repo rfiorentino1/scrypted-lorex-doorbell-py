@@ -164,7 +164,40 @@ class remote:
             return False
 
     def connected(self, *args, **kwargs):
-        return self._connected
+        """Is the peer still there?
+
+        The original implementation returned `self._connected`, a plain
+        bool set True in __init__ and flipped only by our OWN close().
+        Nothing the network did could ever make it return False, so
+        every caller polling it for liveness — including the doorbell
+        plugin's reconnect watchdog — was reading a constant. It is a
+        check that could not fail.
+
+        Now we actually ask the OS. A socket whose peer has gone away
+        selects as READABLE with a zero-byte read pending; MSG_PEEK lets
+        us observe that EOF without consuming real data if some is
+        genuinely waiting.
+        """
+        if not self._connected:
+            return False
+        try:
+            r, _, _ = _select.select([self.sock], [], [], 0)
+            if not r:
+                # Nothing pending: no EOF observable, connection is fine.
+                return True
+            peeked = self.sock.recv(1, socket.MSG_PEEK)
+            if peeked == b'':
+                # Readable but zero bytes == peer sent FIN.
+                self._connected = False
+                return False
+            return True
+        except BlockingIOError:
+            return True
+        except socket.timeout:
+            return True
+        except OSError:
+            self._connected = False
+            return False
 
     def close(self):
         if self._connected:

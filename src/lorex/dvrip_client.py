@@ -135,16 +135,161 @@ class DvripClient:
         self._thread: Optional[threading.Thread] = None
         self._dh: Optional[_LorexBridge] = None
 
+        # Supervisor state. `_heartbeat` is stamped by _run() on every
+        # pass of its inner loop AND at each stage of the outer loop, so
+        # a stale heartbeat means the connection thread itself is stuck
+        # or dead — regardless of WHICH blocking call swallowed it.
+        self._heartbeat: float = time.monotonic()
+        self._heartbeat_lock = threading.Lock()
+        self._supervisor: Optional[threading.Thread] = None
+        self._restarts: int = 0
+        # Generation guard. When the supervisor abandons a wedged
+        # connection thread it cannot force that thread to exit — a
+        # thread stuck in a blocking C call ignores everything. So the
+        # old thread may wake up LATER, inside its own finally block,
+        # and would happily null out `self._dh` belonging to the fresh
+        # connection. Every thread carries the generation it was born
+        # in and only touches shared state while it is still current.
+        self._generation: int = 0
+
     def start(self) -> None:
         if self._thread is not None:
             return
         self._stop.clear()
+        self._beat()
         self._thread = threading.Thread(
-            target=self._run, name=f'dvrip-{self.host}', daemon=True)
+            target=self._run, args=(self._generation,),
+            name=f'dvrip-{self.host}', daemon=True)
         self._thread.start()
+        if self._supervisor is None:
+            self._supervisor = threading.Thread(
+                target=self._supervise, name=f'dvrip-sup-{self.host}',
+                daemon=True)
+            self._supervisor.start()
+
+    # ===== Liveness =====
+
+    def _beat(self) -> None:
+        with self._heartbeat_lock:
+            self._heartbeat = time.monotonic()
+
+    def _since_beat(self) -> float:
+        with self._heartbeat_lock:
+            return time.monotonic() - self._heartbeat
+
+    def _force_teardown(self) -> None:
+        """Break the connection thread out of whatever it is blocked on,
+        from OUTSIDE that thread. Closing the socket is what actually
+        unsticks a blocking recv; setting `terminate` alone does not."""
+        dh = self._dh
+        if dh is None:
+            return
+        try:
+            dh.terminate = True
+        except Exception:
+            pass
+        try:
+            if dh.remote is not None:
+                dh.remote.close()
+        except Exception:
+            pass
+        try:
+            sock = getattr(getattr(dh, 'remote', None), 'sock', None)
+            if sock is not None:
+                sock.close()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _bounded_cleanup(dh, timeout: float = 10.0) -> None:
+        """Run DahuaConsole's cleanup() with a wall clock on it.
+
+        cleanup() issues RPCs over the socket it is tearing down. On a
+        zombie connection that call can block indefinitely, which
+        silently parks the whole reconnect loop — it looks identical to
+        a healthy idle thread from outside.
+        """
+        done = threading.Event()
+
+        def _worker():
+            try:
+                dh.cleanup()
+            except Exception:
+                pass
+            finally:
+                done.set()
+
+        threading.Thread(target=_worker, name='dvrip-cleanup',
+                         daemon=True).start()
+        if not done.wait(timeout=timeout):
+            log.warning('cleanup() did not finish in %.0fs — abandoning it',
+                        timeout)
+
+    def _supervise(self) -> None:
+        """Outer watchdog. Deliberately does NOT trust any of the inner
+        health checks — it judges only on whether _run() is still making
+        progress, so it recovers from causes we have not diagnosed.
+
+        History that earned this: the inner loop already had a stall
+        watchdog and a socket-liveness check, and the doorbell still went
+        silent for 37, 24 and 13.7 days on three separate occasions,
+        recovering only when a human restarted the plugin worker. One of
+        those checks (`remote.connected()`) was reading a flag that could
+        never go false; the others could not be exonerated after the
+        fact. So the rule here is: if no progress, rebuild, no theory
+        required.
+        """
+        while not self._stop.wait(timeout=self.SUPERVISOR_TICK_SEC):
+            try:
+                stale = self._since_beat()
+                if stale <= self.HEARTBEAT_STALL_SEC:
+                    continue
+
+                thread = self._thread
+                alive = thread is not None and thread.is_alive()
+                self._restarts += 1
+                log.error(
+                    'SUPERVISOR: connection thread made no progress for '
+                    '%.0fs (alive=%s) — forcing rebuild #%d',
+                    stale, alive, self._restarts)
+
+                # Unstick it from outside, then abandon it. A thread
+                # wedged in a blocking C call cannot be joined reliably,
+                # so we do not stake recovery on it exiting: it is a
+                # daemon thread and _run's own loop is generation-safe.
+                self._force_teardown()
+                # Deliberately NOT joined. A thread wedged in a blocking
+                # call will not honour a join, and waiting on it would
+                # delay the replacement by exactly as long as the join —
+                # while proving nothing. The generation guard makes
+                # abandoning it safe: it can no longer touch shared
+                # state, and it is a daemon thread.
+                if thread is not None and thread.is_alive():
+                    log.warning('SUPERVISOR: abandoning wedged thread %s',
+                                thread.name)
+
+                try:
+                    self.on_state(False)
+                except Exception:
+                    pass
+
+                self._generation += 1
+                self._dh = None
+                self._beat()
+                self._thread = threading.Thread(
+                    target=self._run, args=(self._generation,),
+                    name=f'dvrip-{self.host}-r{self._restarts}',
+                    daemon=True)
+                self._thread.start()
+                log.info('SUPERVISOR: fresh connection thread started')
+            except Exception as e:
+                # The supervisor must never die — it is the last net.
+                log.exception('SUPERVISOR tick raised (continuing): %r', e)
 
     def stop(self) -> None:
         self._stop.set()
+        sup = self._supervisor
+        self._supervisor = None
         if self._dh is not None:
             try:
                 self._dh.terminate = True
@@ -154,6 +299,8 @@ class DvripClient:
         if self._thread is not None:
             self._thread.join(timeout=5)
             self._thread = None
+        if sup is not None:
+            sup.join(timeout=self.SUPERVISOR_TICK_SEC + 5)
         self._dh = None
 
     # Force a reconnect if no inbound packet has arrived in this many
@@ -171,24 +318,48 @@ class DvripClient:
     # connection is alive. This watchdog is what actually unsticks us.
     STALL_TIMEOUT_SEC = 120
 
-    def _run(self) -> None:
+    # Outer supervisor. HEARTBEAT_STALL_SEC must be comfortably larger
+    # than STALL_TIMEOUT_SEC plus the longest backoff (60s) plus the
+    # connect/attach path, so the supervisor only fires when the inner
+    # loop has genuinely stopped making progress rather than racing a
+    # reconnect that is already under way.
+    SUPERVISOR_TICK_SEC = 15
+    HEARTBEAT_STALL_SEC = 300
+
+    def _is_current(self, gen: int) -> bool:
+        return gen == self._generation and not self._stop.is_set()
+
+    def _run(self, gen: int = 0) -> None:
         backoff = 5
         while not self._stop.is_set():
+            if not self._is_current(gen):
+                log.info('connection thread gen=%d superseded; exiting', gen)
+                return
+            self._beat()
             dargs = _make_dargs(self.host, self.port, self.user,
                                 self.password, self.proto)
             stall_reason: Optional[str] = None
             try:
-                self._dh = _LorexBridge(
+                dh = _LorexBridge(
                     on_event=self.on_event,
                     rhost=self.host, rport=self.port, proto=self.proto,
                     events=True, ssl=False, relay_host=None,
                     timeout=10, udp_server=True, dargs=dargs,
                 )
+                if not self._is_current(gen):
+                    try:
+                        dh.remote.close()
+                    except Exception:
+                        pass
+                    return
+                self._dh = dh
                 log.info('connecting to %s:%s (proto=%s)',
                          self.host, self.port, self.proto)
+                self._beat()
                 ok = self._dh.dh_connect(
                     username=self.user, password=self.password,
                     logon='default')
+                self._beat()
                 if not ok:
                     raise RuntimeError('dh_connect returned falsy')
                 log.info('logged in; attaching eventManager')
@@ -204,8 +375,20 @@ class DvripClient:
                 log.info('eventManager attached; stall watchdog armed '
                          '(threshold=%ds)', self.STALL_TIMEOUT_SEC)
 
+                self._beat()
+
                 while not self._stop.is_set():
                     time.sleep(1)
+                    # An abandoned thread must never stamp the
+                    # heartbeat — that would mask a wedged CURRENT
+                    # thread and re-create the exact silent failure
+                    # this supervisor exists to catch.
+                    if not self._is_current(gen):
+                        return
+                    # Progress stamp for the outer supervisor. This is
+                    # the ONLY thing it reads, so it stays at the top of
+                    # the loop, before any check that might raise.
+                    self._beat()
                     # 1) DahuaConsole's keepalive thread already detected
                     #    a real disconnect and tore itself down.
                     if self._dh.terminate:
@@ -232,28 +415,44 @@ class DvripClient:
             except Exception as e:
                 log.error('connection failed: %r', e)
             finally:
-                if stall_reason is not None:
-                    log.warning('forcing reconnect: %s', stall_reason)
-                    # Best-effort hard tear-down so the cleanup path below
-                    # doesn't try to RPC over a dead/zombie socket and
-                    # block on it.
-                    try:
-                        if self._dh is not None:
-                            self._dh.terminate = True
-                    except Exception:
-                        pass
-                    try:
-                        if self._dh is not None and self._dh.remote is not None:
-                            self._dh.remote.close()
-                    except Exception:
-                        pass
-                self.on_state(False)
+                # Nothing in here may raise. An exception escaping a
+                # finally kills the connection thread outright, and a
+                # dead thread is precisely the failure mode we cannot
+                # see from the outside. (`on_state` was previously
+                # called bare here.)
                 try:
-                    if self._dh is not None:
-                        self._dh.cleanup()
+                    dh = self._dh
+                    if stall_reason is not None:
+                        log.warning('forcing reconnect: %s', stall_reason)
+                        # Best-effort hard tear-down so the cleanup path
+                        # below doesn't try to RPC over a dead/zombie
+                        # socket and block on it.
+                        try:
+                            if dh is not None:
+                                dh.terminate = True
+                        except Exception:
+                            pass
+                        try:
+                            if dh is not None and dh.remote is not None:
+                                dh.remote.close()
+                        except Exception:
+                            pass
+                    try:
+                        self.on_state(False)
+                    except Exception:
+                        log.exception('on_state(False) raised (ignored)')
+                    # cleanup() talks to the device and has no timeout of
+                    # its own, so it can block forever on a zombie
+                    # socket. Bound it: run it in a throwaway thread and
+                    # walk away if it does not finish.
+                    if dh is not None:
+                        self._bounded_cleanup(dh)
+                    if self._is_current(gen):
+                        self._dh = None
                 except Exception:
-                    pass
-                self._dh = None
+                    log.exception('teardown raised (ignored)')
+                finally:
+                    self._beat()
             if self._stop.is_set():
                 break
             log.info('reconnecting in %ds', backoff)
