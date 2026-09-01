@@ -2,10 +2,12 @@
 
 Implements Camera/VideoCamera/BinarySensor/MotionSensor/Settings/Intercom.
 DVRIP connection lifecycle is owned here (replacing the old separate
-bridge.py daemon + SSE plumbing). Press-event semantics match the prior
-TS plugin: triggerPress is idempotent within a 3s hold window so a real
-press chain (BackKeyLight + VideoTalk + CallNoAnswered + PhoneCallDetect
-all firing within ~20ms) only produces ONE HomeKit notification.
+bridge.py daemon + SSE plumbing). Press dedup is call-scoped: the first
+press code of a doorbell call notifies once and opens an "in-call"
+window; the SIP no-answer retries that re-fire the press codes seconds
+later are suppressed until the call ends (CallNoAnswered, or a backstop
+timeout). This mirrors the Lorex app, which notifies once per call. See
+the RING_CODES / call-end commentary below for the full rationale.
 """
 import asyncio
 import datetime
@@ -33,34 +35,44 @@ from lorex.talk import TalkSession
 log = logging.getLogger('lorex.camera')
 
 
-# Press semantics: any of these codes (Start or Pulse) means the button
-# was pressed. We OR-trigger because Lorex Skywatch firmware emits a
-# different subset on each press; relying on any single code misses
-# presses. Each code below has been verified against the bridge log to
-# fire ONLY in press chains, never during motion-only events.
+# Press detection. A SINGLE physical press starts a SIP call: the
+# doorbell rings its paired VTH, and while unanswered it cycles the call
+# (re-firing call-state events) until a ~14s no-answer timeout. The Lorex
+# app notifies ONCE per call; we mirror that with an in-call window (the
+# first ring opens it + notifies, everything until the call ends is
+# suppressed, a genuinely separate later press notifies again).
 #
-# DO NOT add `BackKeyLight` here. It was previously included on the
-# (mistaken) assumption that the button-LED pulse was press-only, but
-# the bridge log shows BackKeyLight Pulse firing during motion-only
-# sequences (e.g. 2026-04-24 19:06:21 and 21:59:03/30 — VideoMotion +
-# CrossRegionDetection chains with no VideoTalk/PhoneCallDetect). The
-# doorbell pulses the button LED for visibility during motion at night,
-# so it's NOT a reliable press signal.
-#
-# DO NOT add `CallNoAnswered` here. Per the Dahua VTO event vocabulary
-# (riogrande75/Dahua DahuaEventHandler.php), CallNoAnswered fires at
-# the SIP no-answer timeout — roughly 10 seconds AFTER the press, when
-# the doorbell gives up trying to ring its paired VTH. Including it
-# caused a duplicate press chain ~10s after the real press, since
-# PRESS_HOLD_SEC (3s) had already elapsed by then. Verified 2026-04-29
-# from clip-offset analysis: real press at T, wave-1 codes (VideoTalk
-# + PhoneCallDetect + VideoTalkInvite) fire at T+4s, CallNoAnswered
-# fires at T+14s.
-PRESS_CODES: Set[str] = {
-    'VideoTalk',
-    'PhoneCallDetect',
+# What actually marks the ring vs. noise — verified 2026-05-29 from a
+# full event capture of one real press (see project_doorbell_event_clips
+# memory). The ring (call START) is signalled by, any of:
+#   - `VideoTalk` whose data Type == "Invite"  (the SIP INVITE itself)
+#   - `VideoTalkInvite`                         (alternate ring code)
+#   - `PhoneCallDetect` action Start            (fires alongside the ring)
+# We OR these for robustness (firmware emits a varying subset) — the
+# in-call window collapses the cluster to one notification.
+RING_CODES: Set[str] = {
     'VideoTalkInvite',
+    'PhoneCallDetect',
 }
+
+# `VideoTalk` ALSO fires with Type "Hangup" and "Answer" — these are
+# call-state TRANSITIONS, not presses ("Answer" is often induced by our
+# OWN RTSP/snapshot pull of the stream). They must NOT trigger a press.
+# Only Type "Invite" (or a missing Type) counts as a ring.
+VIDEOTALK_RING_TYPES: Set[Optional[str]] = {None, 'Invite'}
+VIDEOTALK_END_TYPES: Set[str] = {'Hangup'}
+
+# Closing the in-call window. DO NOT close on `CallNoAnswered` blindly:
+# its `Start` action fires ~T+1s (right after the ring, carrying a
+# `CallID`), and only its `Stop` action (~T+14s) marks the no-answer
+# cycle finishing. Closing on Start reopened the window immediately and
+# re-notified. So we close only on:
+#   - `CallNoAnswered` action == "Stop"
+#   - `VideoTalk` Type == "Hangup"
+# ...or the CALL_WINDOW_MAX_SEC backstop if neither is seen.
+#
+# DO NOT add `BackKeyLight` as a ring code: it pulses for the motion LED
+# at night with no call (verified — fires standalone, no VideoTalk).
 
 MOTION_CODES: Set[str] = {
     'VideoMotion',
@@ -69,7 +81,15 @@ MOTION_CODES: Set[str] = {
     'CrossRegionDetection',
 }
 
+# binaryState pulse width — how long HomeKit sees the doorbell as
+# "pressed" per ding. Unchanged from prior behavior; governs the visible
+# button-press state only, NOT the duplicate-notification dedup (that's
+# the in-call window below).
 PRESS_HOLD_SEC = 3.0
+# Backstop for closing the in-call window if no CallNoAnswered is seen
+# (comfortably longer than the ~14s no-answer episode, shorter than the
+# gap between distinct visitors).
+CALL_WINDOW_MAX_SEC = 30.0
 MOTION_HOLD_SEC = 5.0
 
 
@@ -83,6 +103,11 @@ class LorexDoorbellCamera(ScryptedDeviceBase):
         self._press_reset: Optional[asyncio.TimerHandle] = None
         self._motion_reset: Optional[asyncio.TimerHandle] = None
         self._seen_codes: Set[str] = set()
+
+        # In-call dedup window (see RING_CODES / call-end above):
+        # True from the first press code of a call until the call ends.
+        self._in_call: bool = False
+        self._call_reset: Optional[asyncio.TimerHandle] = None
 
         self._talk: Optional[TalkSession] = None
         self._intercom_task: Optional[asyncio.Task] = None
@@ -155,18 +180,49 @@ class LorexDoorbellCamera(ScryptedDeviceBase):
         code = evt.get('code') or ''
         action = evt.get('action') or ''
 
+        # TEMP DEBUG (2026-05-29): dump every event with its full payload so
+        # we can see the real press/retry/call-end structure and find a
+        # clean per-call discriminator. Remove once the dedup is verified.
+        try:
+            with open('/tmp/lorex_events.log', 'a') as _f:
+                _f.write('%.3f %s %s idx=%s in_call=%s data=%s\n' % (
+                    time.time(), code, action, evt.get('index'),
+                    self._in_call, json.dumps(evt.get('data'))))
+        except Exception:
+            pass
+
         if code and code not in self._seen_codes:
             self._seen_codes.add(code)
             log.info('[%s] First-time event: %s action=%s',
                      self.nativeId, code, action)
 
-        if code in PRESS_CODES:
+        data = evt.get('data') if isinstance(evt.get('data'), dict) else {}
+
+        # VideoTalk is overloaded: Type "Invite" is the ring; "Hangup"
+        # ends the call; "Answer" (and anything else) are call-state
+        # transitions we must ignore so our own stream pulls don't
+        # masquerade as presses.
+        if code == 'VideoTalk':
+            if action in ('Start', 'Pulse'):
+                vtype = data.get('Type')
+                if vtype in VIDEOTALK_END_TYPES:
+                    self._end_call()
+                elif vtype in VIDEOTALK_RING_TYPES:
+                    self._trigger_press()
+                # else: 'Answer' / other transition — ignore.
+            return
+
+        # CallNoAnswered marks call END only on its Stop action; its
+        # Start fires right after the ring and must NOT close the window.
+        if code == 'CallNoAnswered':
+            if action == 'Stop':
+                self._end_call()
+            return
+
+        if code in RING_CODES:
             if action in ('Start', 'Pulse'):
                 self._trigger_press()
-            elif action == 'Stop':
-                # Real Stop fires much later than the press hold; ignore
-                # to avoid prematurely clearing the button-press state.
-                pass
+            # Stop fires much later; ignore.
             return
 
         if code in MOTION_CODES:
@@ -179,23 +235,38 @@ class LorexDoorbellCamera(ScryptedDeviceBase):
             return
 
     def _trigger_press(self) -> None:
-        # Idempotent within hold window: only flip false→true on the
-        # FIRST event in a press chain. Subsequent events refresh the
-        # auto-reset timer but don't re-emit binaryState.
-        first_press_in_chain = not self.binaryState
-        if first_press_in_chain:
+        # One notification per call. The first press code of a call opens
+        # the in-call window and notifies; the SIP no-answer retries that
+        # re-fire press codes within the window are suppressed. See the
+        # RING_CODES / call-end commentary above.
+        notify = not self._in_call
+
+        if notify:
             self.binaryState = True
+            self._in_call = True
+
+        # binaryState pulse: HomeKit sees "pressed" for PRESS_HOLD_SEC,
+        # then it clears. Unchanged behavior — governs the visible
+        # button-press state only. (Re)arm on every press code.
         if self._press_reset is not None:
             self._press_reset.cancel()
         self._press_reset = self._loop.call_later(
             PRESS_HOLD_SEC, self._reset_press)
 
+        # (Re)arm the in-call backstop. Each press code (including the
+        # no-answer retries) extends it, so the window doesn't lapse
+        # mid-call; CallNoAnswered normally closes it well before this.
+        if self._call_reset is not None:
+            self._call_reset.cancel()
+        self._call_reset = self._loop.call_later(
+            CALL_WINDOW_MAX_SEC, self._end_call)
+
         # Optional webhook for external integrations (e.g. NAS-side event
         # extractor that builds pre-roll+post-roll clips from continuous
-        # recordings). Fire only on the first press in a chain so the
-        # external system gets one notification per real press, mirroring
-        # HomeKit's binaryState semantics.
-        if first_press_in_chain:
+        # recordings). Fire once per call, matching the HomeKit
+        # notification, so the external system gets one clip per real
+        # press instead of one per no-answer retry.
+        if notify:
             webhook_url = (self.storage.getItem('pressWebhookUrl') or '').strip()
             if webhook_url:
                 press_ts = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
@@ -204,6 +275,14 @@ class LorexDoorbellCamera(ScryptedDeviceBase):
                     args=(webhook_url, press_ts),
                     daemon=True,
                 ).start()
+
+    def _end_call(self) -> None:
+        # Close the in-call dedup window. Called on CallNoAnswered (the
+        # normal call-end marker) or via the CALL_WINDOW_MAX_SEC backstop.
+        self._in_call = False
+        if self._call_reset is not None:
+            self._call_reset.cancel()
+            self._call_reset = None
 
     def _fire_press_webhook(self, url: str, timestamp: str) -> None:
         """Best-effort POST. Never raises — webhook failures must not
