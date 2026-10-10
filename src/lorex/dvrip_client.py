@@ -363,10 +363,19 @@ class DvripClient:
                 if not ok:
                     raise RuntimeError('dh_connect returned falsy')
                 log.info('logged in; attaching eventManager')
-                self._dh.instance_service(
+                attached = self._dh.instance_service(
                     'eventManager',
                     attach_params={'codes': ['All']},
                     start=True)
+                # dh_connect() with events enabled already instantiates + attaches
+                # eventManager itself; the second call then returns False only because
+                # it is already in instance_serviceDB. That is success, not failure.
+                if not attached and 'eventManager' not in getattr(
+                        self._dh, 'instance_serviceDB', {}):
+                    # instance_service returns False (no exception) when the attach fails.
+                    # Ignoring that is how the B241AJC ran a month with zero events:
+                    # connected, keepalives fine, never subscribed.
+                    raise RuntimeError('eventManager attach failed')
                 self.on_state(True)
                 backoff = 5
                 # Reset liveness clock on (re)attach — we want a full grace

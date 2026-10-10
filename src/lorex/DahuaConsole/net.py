@@ -1162,9 +1162,12 @@ sock.close()
             "method": "system.listService",
             "params": None,
         }
-        if not len(self.RemoteServicesCache):
-            self.RemoteServicesCache = self.send_call(query_args)
-            if not self.RemoteServicesCache:
+        if not isinstance(self.RemoteServicesCache, dict) or not len(self.RemoteServicesCache):
+            # errorcodes=True: without it send_call collapses an error reply to False, which
+            # used to be cached here and then crash the next lookup with len(False).
+            self.RemoteServicesCache = self.send_call(query_args, errorcodes=True)
+            if not isinstance(self.RemoteServicesCache, dict):
+                self.RemoteServicesCache = {}
                 return False
         if service == 'dump':
             return
@@ -1173,6 +1176,13 @@ sock.close()
             for count in range(0, len(self.RemoteServicesCache.get('params').get('service'))):
                 if self.RemoteServicesCache.get('params').get('service')[count] == service:
                     return True
+        else:
+            # Some firmware (Lorex B241AJC, 2026-09) has no system.listService at all and
+            # answers InterfaceNotFound, yet eventManager.factory.instance/attach work fine.
+            # "Can't list services" is not "service missing": let the real call decide.
+            log.warning("system.listService unsupported ({}); assuming [{}] exists".format(
+                (self.RemoteServicesCache.get('error') or {}).get('message'), service))
+            return True
 
         log.failure("Service [{}] not supported on remote device".format(service))
         return False
