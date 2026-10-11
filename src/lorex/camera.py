@@ -53,6 +53,10 @@ log = logging.getLogger('lorex.camera')
 RING_CODES: Set[str] = {
     'VideoTalkInvite',
     'PhoneCallDetect',
+    # Lorex B241AJC (installed 2026-09-18) sends NO VideoTalk at all. A real
+    # press (2026-10-11 09:21 ET) produced: CallNoAnswered Start+Stop (data null),
+    # then `Calling` Start with LocaleTime/UTC. `Calling` is its ring.
+    'Calling',
 }
 
 # `VideoTalk` ALSO fires with Type "Hangup" and "Answer" — these are
