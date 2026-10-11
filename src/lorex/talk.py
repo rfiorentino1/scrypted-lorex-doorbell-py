@@ -118,6 +118,19 @@ class TalkSession:
     # === lifecycle ===
 
     def open(self):
+        # Any failure after the doorbell has handed us a talk object must give it
+        # back, or the doorbell's single talk slot stays held and every later
+        # Talk.General (and on the B241AJC even new presses) fail as "busy".
+        try:
+            self._open()
+        except Exception:
+            try:
+                self.close()
+            except Exception:
+                pass
+            raise
+
+    def _open(self):
         # 1) DVRIP login
         self.dh = DahuaFunctions(
             rhost=self.host, rport=self.port, proto='dvrip',
@@ -234,7 +247,7 @@ class TalkSession:
                     "ParameterName": "Dahua.Device.Network.ControlConnection.Passive",
                     "ConnectionID": self.conn_id,
                 }, txid=132)
-                self._send_recv_on_remote(rm_pkt, timeout=1.0)
+                self._send_recv_on_remote(rm_pkt, timeout=3.0)
             except Exception:
                 pass
         # 2) Close talk uplink TCP
@@ -298,3 +311,25 @@ if __name__ == '__main__':
     p.add_argument('--password', required=True, help='Doorbell password')
     args = p.parse_args()
     stream_stdin_to_doorbell(args.host, args.port, args.user, args.password)
+
+
+def talk_slot_busy_error(exc) -> bool:
+    """True when an open() failure was the doorbell refusing Talk.General as busy."""
+    return 'ErrorReason:1' in str(exc)
+
+
+def reboot_doorbell(host, port=35000, user='admin', password=None):
+    """Ask the doorbell to reboot (magicBox.reboot). Returns True if it accepted."""
+    t = TalkSession(host=host, port=port, user=user, password=password)
+    t.dh = DahuaFunctions(rhost=host, rport=port, proto='dvrip', events=False, ssl=False,
+                          relay_host=None, timeout=10, udp_server=True, dargs=t._make_dargs())
+    if not t.dh.dh_connect(username=user, password=password, logon='default'):
+        return False
+    try:
+        r = t.dh.send_call({"method": "magicBox.reboot", "params": None}, errorcodes=True)
+        return bool(isinstance(r, dict) and r.get('result'))
+    finally:
+        try:
+            t.dh.cleanup()
+        except Exception:
+            pass

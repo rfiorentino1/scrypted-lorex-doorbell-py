@@ -30,7 +30,7 @@ from scrypted_sdk import (
 
 from lorex.dvrip_client import DvripClient
 from lorex.snapshot import take_snapshot_via_ffmpeg
-from lorex.talk import TalkSession
+from lorex.talk import TalkSession, reboot_doorbell, talk_slot_busy_error
 
 log = logging.getLogger('lorex.camera')
 
@@ -90,6 +90,13 @@ MOTION_CODES: Set[str] = {
 # button-press state only, NOT the duplicate-notification dedup (that's
 # the in-call window below).
 PRESS_HOLD_SEC = 3.0
+
+# Stuck-call self-heal (2026-10-11). The B241AJC can get stuck "in a call":
+# its single talk slot stays held, new presses produce no events, and talk
+# lags ~20 s / is refused as busy. Only a doorbell reboot clears it. A normal
+# call ends with `Calling` Stop / CallNoAnswered Stop within ~30 s.
+STUCK_CALL_SEC = 180.0
+REBOOT_MIN_INTERVAL_SEC = 900.0
 # Backstop for closing the in-call window if no CallNoAnswered is seen
 # (comfortably longer than the ~14s no-answer episode, shorter than the
 # gap between distinct visitors).
@@ -114,6 +121,9 @@ class LorexDoorbellCamera(ScryptedDeviceBase):
         self._call_reset: Optional[asyncio.TimerHandle] = None
 
         self._talk: Optional[TalkSession] = None
+        self._calling_since: Optional[float] = None
+        self._stuck_check: Optional[asyncio.TimerHandle] = None
+        self._last_reboot: float = 0.0
         self._intercom_task: Optional[asyncio.Task] = None
         self._intercom_proc: Optional[asyncio.subprocess.Process] = None
 
@@ -223,6 +233,15 @@ class LorexDoorbellCamera(ScryptedDeviceBase):
                 self._end_call()
             return
 
+        if code == 'Calling':
+            if action in ('Start', 'Pulse'):
+                self._calling_since = time.monotonic()
+                if self._stuck_check is not None:
+                    self._stuck_check.cancel()
+                self._stuck_check = self._loop.call_later(STUCK_CALL_SEC, self._check_stuck_call)
+            elif action == 'Stop':
+                self._calling_since = None
+
         if code in RING_CODES:
             if action in ('Start', 'Pulse'):
                 self._trigger_press()
@@ -279,6 +298,40 @@ class LorexDoorbellCamera(ScryptedDeviceBase):
                     args=(webhook_url, press_ts),
                     daemon=True,
                 ).start()
+
+    def _check_stuck_call(self) -> None:
+        self._stuck_check = None
+        if self._calling_since is None:
+            return
+        if self._talk is not None:
+            # Someone is talking right now; look again later rather than cut them off.
+            self._stuck_check = self._loop.call_later(60.0, self._check_stuck_call)
+            return
+        log.warning('[%s] call never ended (%.0fs) — doorbell looks stuck in a call',
+                    self.nativeId, time.monotonic() - self._calling_since)
+        self._schedule_doorbell_reboot('call never ended')
+
+    def _schedule_doorbell_reboot(self, reason: str) -> None:
+        now = time.monotonic()
+        if now - self._last_reboot < REBOOT_MIN_INTERVAL_SEC:
+            log.warning('[%s] doorbell reboot wanted (%s) but one ran %.0fs ago; skipping',
+                        self.nativeId, reason, now - self._last_reboot)
+            return
+        self._last_reboot = now
+        self._calling_since = None
+        ip = self.storage.getItem('ip') or ''
+        port = int(self.storage.getItem('dvripPort') or 35000)
+        user = self.storage.getItem('username') or 'admin'
+        pwd = self.storage.getItem('password') or ''
+
+        def run():
+            try:
+                ok = reboot_doorbell(ip, port, user, pwd)
+                log.warning('[%s] auto-reboot of doorbell (%s): %s', self.nativeId, reason,
+                            'accepted' if ok else 'FAILED')
+            except Exception as e:
+                log.error('[%s] auto-reboot of doorbell (%s) raised: %r', self.nativeId, reason, e)
+        threading.Thread(target=run, daemon=True).start()
 
     def _end_call(self) -> None:
         # Close the in-call dedup window. Called on CallNoAnswered (the
@@ -530,6 +583,10 @@ class LorexDoorbellCamera(ScryptedDeviceBase):
             # Failure path: clean up partially-initialized talk session
             # so the next attempt isn't blocked by stale state.
             log.error('[%s] intercom: startIntercom failed: %r', self.nativeId, e)
+            if talk_slot_busy_error(e):
+                # Nothing of ours holds the slot (prior session was stopped above),
+                # so the doorbell itself is stuck in a call. Heal it.
+                self._schedule_doorbell_reboot('talk refused as busy')
             try:
                 await asyncio.to_thread(self._talk.close)
             except Exception:
